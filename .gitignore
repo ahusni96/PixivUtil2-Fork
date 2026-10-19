@@ -18,7 +18,7 @@ dist*/*
 old/*
 config.ini
 config.ini.error*
-listfanbox.txt
+list.txt
 *.log
 *.bat
 db.sqlite
@@ -68,3 +68,6 @@ Network Trash Folder
 Temporary Items
 .apdisk
 Error*
+test/cookie.txt
+test/fanbox_cookie.txt
+test/test_browser.py

@@ -3,43 +3,103 @@
 
 import http.client
 import http.cookiejar
+import io
 import json
 import re
 import socket
 import sys
 import time
 import traceback
-from typing import List, Literal, Tuple, Union
 from urllib.error import HTTPError
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from urllib.request import Request
+from typing import List, Tuple, Union
 
-import curl_cffi
 import demjson3
 import mechanize
 import socks
 from bs4 import BeautifulSoup
 from colorama import Fore, Style
+import curl_cffi
 
 import common.PixivHelper as PixivHelper
-from common.PixivException import PixivException
-from common.PixivOAuth import PixivOAuth
 from model.PixivArtist import PixivArtist
 from model.PixivBookmark import PixivNewIllustBookmark
+from common.PixivException import PixivException
 from model.PixivImage import PixivImage, PixivMangaSeries
 from model.PixivModelFanbox import FanboxArtist, FanboxPost
 from model.PixivModelSketch import SketchArtist, SketchPost
 from model.PixivNovel import MAX_LIMIT, NovelSeries, PixivNovel
+from common.PixivOAuth import PixivOAuth
 from model.PixivRanking import PixivNewIllust, PixivRanking
-from model.PixivTags import PixivTag, PixivTags
+from model.PixivTags import PixivTags
 
 defaultCookieJar = None
 defaultConfig = None
 _browser = None
 
 
+def _looks_like_cloudflare_challenge(body):
+    """ True if the (error) body looks like a Cloudflare challenge page. """
+    if isinstance(body, (bytes, bytearray)):
+        text = bytes(body).decode("utf-8", "replace")
+    else:
+        text = str(body)
+    markers = ("Just a moment...", "cf-chl", "challenge-platform", "cf_chl_opt")
+    return any(m in text for m in markers)
+
+
+class _CurlHTTPError(HTTPError):
+    """ HTTPError for curl_cffi responses; mimics mechanize's HTTPError.get_data(). """
+
+    def __init__(self, url, code, msg, hdrs, body):
+        self._body = body
+        super().__init__(url, code, msg, hdrs, io.BytesIO(body))
+
+    def get_data(self):
+        return self._body
+
+
+class _CurlResponse:
+    """ Minimal file-like wrapper around a curl_cffi response (read/geturl/getcode/close). """
+
+    def __init__(self, response):
+        self.code = response.status_code
+        self.status = response.status_code
+        self.headers = response.headers
+        self.url = str(response.url)
+        self._buffer = io.BytesIO(response.content)
+
+    def read(self, size=-1):
+        return self._buffer.read(size)
+
+    def geturl(self):
+        return self.url
+
+    def getcode(self):
+        return self.code
+
+    def info(self):
+        return self.headers
+
+    def close(self):
+        self._buffer.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
 # pylint: disable=E1101
 class PixivBrowser(mechanize.Browser):
+    # Requests to pixiv.net and fanbox.cc (and their subdomains) go through curl_cffi
+    # (browser-like TLS fingerprint). Cloudflare answers 403 to mechanize's Python TLS stack.
+    _use_curl_transport = True
+    _curl_hosts = ("pixiv.net", "fanbox.cc")
+    _last_set_cookie_names = []
+
     _config = None
     _cache = dict()
     _max_cache = 10000  # keep n-item in memory
@@ -200,27 +260,263 @@ class PixivBrowser(mechanize.Browser):
             defaultCookieJar = http.cookiejar.LWPCookieJar()
         defaultCookieJar.clear()
 
+    # ---- curl_cffi transport for www.pixiv.net ------------------------------
+    # Default TLS fingerprint for curl_cffi. Keep the `useragent` in config.ini a
+    # matching Firefox string, and take cf_clearance from that same browser/IP.
+    _default_impersonate = "firefox135"
+
+    def _curl_impersonate_target(self):
+        """ curl_cffi impersonation target: config override if set, otherwise Firefox. """
+        override = getattr(self._config, "curlImpersonate", None)
+        return override or self._default_impersonate
+
+    def _use_curl_for(self, url, data, method):
+        if not self._use_curl_transport or self._config is None:
+            return False
+        if method not in ("GET", "POST"):
+            return False
+        host = (urlparse(url).hostname or "").lower()
+        return any(host == h or host.endswith("." + h) for h in self._curl_hosts)
+
+    def _cookie_jars(self):
+        jars = []
+        for jar in (getattr(self, "cookiejar", None), defaultCookieJar):
+            if jar is not None and all(jar is not j for j in jars):
+                jars.append(jar)
+        return jars
+
+    def _collect_cookies(self, url):
+        """ Cookies applicable to url's host, as a plain dict for curl_cffi. """
+        host = (urlparse(url).hostname or "").lower()
+        cookies = {}
+        for jar in self._cookie_jars():
+            for c in jar:
+                domain = (c.domain or "").lstrip(".").lower()
+                if not domain or not (host == domain or host.endswith("." + domain)):
+                    continue
+                if c.is_expired():
+                    continue
+                cookies[c.name] = c.value
+        return cookies
+
+    def _drop_cookies(self, name, domain):
+        """ Remove same-named cookies of the same site, so only the newest value is sent. """
+        for jar in self._cookie_jars():
+            for old in list(jar):
+                old_domain = (old.domain or "").lstrip(".").lower()
+                if old.name != name or not old_domain:
+                    continue
+                if old_domain == domain or old_domain.endswith("." + domain) or domain.endswith("." + old_domain):
+                    try:
+                        jar.clear(old.domain, old.path, old.name)
+                    except KeyError:
+                        pass
+
+    def _store_curl_cookies(self, response, url):
+        """ Keep cookies set by the server (e.g. __cf_bm, a rotated or new session) for later requests.
+            curl_cffi reports host-only cookies with an empty domain, so fall back to the request host. """
+        host = (urlparse(url).hostname or "").lower()
+        try:
+            jar = getattr(response.cookies, "jar", None)
+            if jar is None:
+                return
+            self._last_set_cookie_names = sorted({c.name for c in jar})
+            for c in jar:
+                if c.is_expired():
+                    continue
+                domain = (c.domain or host).lstrip(".").lower()
+                if not domain:
+                    continue
+                self._drop_cookies(c.name, domain)
+                self.addCookie(http.cookiejar.Cookie(version=0, name=c.name, value=c.value, port=None,
+                                                     port_specified=False, domain=domain, domain_specified=False,
+                                                     domain_initial_dot=False, path=c.path or "/", path_specified=True,
+                                                     secure=False, expires=c.expires, discard=c.expires is None,
+                                                     comment=None, comment_url=None, rest={'HttpOnly': None},
+                                                     rfc2109=False))
+        except Exception:
+            PixivHelper.get_logger().debug("Unable to store cookies from curl_cffi response", exc_info=True)
+
+    def _log_login_check_failure(self, final_url, page, site_url="https://www.pixiv.net",
+                                 dump_name="login_check_failed.html", label="Login check"):
+        """ Explain why a cookie login check failed and save the returned page.
+            Only cookie names are logged, never their values. """
+        markers = ("logout.php", "pixiv.user.loggedIn = true", "login: 'yes'", "login: 'no'", "dataLayer",
+                   "global-data", "preload-data", "isLoggedIn", "Just a moment", "cf-chl", "turnstile",
+                   "challenge_basic_security_FANBOX", "FANBOXSESSID")
+        found = [m for m in markers if m in page]
+        match = re.search(r"<title[^>]*>(.*?)</title>", page, re.S | re.I)
+        title = match.group(1).strip()[:80] if match else None
+        sent = sorted(self._collect_cookies(site_url))
+        PixivHelper.print_and_log('error',
+                                  f"{label} failed: final url={final_url}, page length={len(page)}, title={title!r}, "
+                                  f"markers found={found}, cookies sent={sent}, "
+                                  f"cookies set by server={self._last_set_cookie_names}, "
+                                  f"impersonate={self._curl_impersonate_target()}, "
+                                  f"user-agent={self._config.useragent!r}, "
+                                  f"proxy={'on' if self._config.useProxy else 'off'}")
+        PixivHelper.dump_html(dump_name, page)
+        PixivHelper.print_and_log('error', f'Saved the page the server returned to {dump_name} '
+                                           '(it may contain account details, so check it before sharing).')
+
+    def _load_cloudflare_cookies(self, domain=".pixiv.net", site_url="https://www.pixiv.net/"):
+        """ Apply cf_clearance / __cf_bm from config.ini to requests for the given site.
+            Needed because loginUsingCookie() clears the jar before loading the login cookie. """
+        # Cookies already loaded from the pasted cookie string win: they come from one browser
+        # session and are a matched set, whereas config values may be stale leftovers.
+        already = self._collect_cookies(site_url)
+        for name, value in (("cf_clearance", getattr(self._config, "cf_clearance", "")),
+                            ("__cf_bm", getattr(self._config, "cf_bm", ""))):
+            if not value or name in already:
+                continue
+            self.addCookie(http.cookiejar.Cookie(version=0, name=name, value=value, port=None,
+                                                 port_specified=False, domain=domain, domain_specified=False,
+                                                 domain_initial_dot=False, path='/', path_specified=True,
+                                                 secure=False, expires=None, discard=True, comment=None,
+                                                 comment_url=None, rest={'HttpOnly': None}, rfc2109=False))
+
+    def _log_curl_failure(self, url, kwargs, response):
+        """ One diagnostic line for failed curl_cffi requests. Cookie values are never logged. """
+        ua = kwargs["headers"].get("User-Agent", "")
+        target = kwargs["impersonate"]
+        sent = sorted(kwargs["cookies"])
+        notes = []
+        for family in ("firefox", "chrome"):
+            if target.startswith(family) and family not in ua.lower():
+                notes.append(f"useragent does not look like {family} but the TLS fingerprint is {target}")
+        if "cf_clearance" not in sent:
+            notes.append("no cf_clearance cookie was sent")
+        headers = response.headers
+        PixivHelper.print_and_log('error',
+                                  f"curl_cffi diagnostics for {url}: status={response.status_code}, "
+                                  f"impersonate={target}, user-agent={ua!r}, cookies sent={sent}, "
+                                  f"server={headers.get('server', '')}, cf-mitigated={headers.get('cf-mitigated', '')}, "
+                                  f"cf-ray={headers.get('cf-ray', '')}"
+                                  + (f" | NOTE: {'; '.join(notes)}" if notes else ""))
+
+    def _default_referer(self, url):
+        host = (urlparse(url).hostname or "").lower()
+        if host == "fanbox.cc" or host.endswith(".fanbox.cc"):
+            return "https://www.fanbox.cc/"
+        return "https://www.pixiv.net"
+
+    def _curl_kwargs(self, url, headers, timeout):
+        kwargs = dict(impersonate=self._curl_impersonate_target(),
+                      headers=headers,
+                      cookies=self._collect_cookies(url),
+                      timeout=timeout,
+                      verify=bool(self._config.enableSSLVerification))
+        if self._config.useProxy:
+            kwargs["proxies"] = {"http": self._config.proxyAddress,
+                                 "https": self._config.proxyAddress}
+        return kwargs
+
+    def _curl_finish(self, url, kwargs, response):
+        """ Remember the cookies the server set, turn HTTP errors into HTTPError, wrap the response. """
+        self._store_curl_cookies(response, url)
+        if response.status_code >= 400:
+            self._log_curl_failure(url, kwargs, response)
+            raise _CurlHTTPError(url, response.status_code, getattr(response, "reason", "") or "",
+                                 response.headers, response.content)
+        return _CurlResponse(response)
+
+    def _curl_open(self, url, req_headers, timeout, method="GET", data=None):
+        headers = {k: v for k, v in req_headers.items()
+                   if k.lower() not in ("cookie", "host", "content-length", "user-agent")}
+        headers["User-Agent"] = self._config.useragent
+        if not any(k.lower() == "referer" for k in headers):
+            headers["Referer"] = self._default_referer(url)
+
+        if method == "GET":
+            kwargs = self._curl_kwargs(url, headers, timeout)
+            response = curl_cffi.get(url, **kwargs)
+            return self._curl_finish(url, kwargs, response)
+
+        # POST: follow redirects by hand. curl_cffi only reports the cookies of the last response
+        # when it follows redirects itself, which would lose e.g. the FANBOXSESSID set mid-chain.
+        body = data
+        if isinstance(body, str):
+            body = body.encode("utf-8")
+        if isinstance(body, (bytes, bytearray)) and not any(k.lower() == "content-type" for k in headers):
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        current_method = method
+        for _ in range(10):
+            hop_headers = dict(headers)
+            if current_method == "GET":
+                hop_headers = {k: v for k, v in hop_headers.items() if k.lower() != "content-type"}
+            kwargs = self._curl_kwargs(url, hop_headers, timeout)
+            kwargs["allow_redirects"] = False
+            if current_method == "POST":
+                response = curl_cffi.post(url, data=body, **kwargs)
+            else:
+                response = curl_cffi.get(url, **kwargs)
+
+            location = response.headers.get("location")
+            if response.status_code in (301, 302, 303, 307, 308) and location:
+                self._store_curl_cookies(response, url)
+                url = urljoin(url, location)
+                if response.status_code in (301, 302, 303):  # browsers switch to GET here
+                    current_method, body = "GET", None
+                continue
+            return self._curl_finish(url, kwargs, response)
+        raise PixivException(f"Too many redirects while requesting {url}", errorCode=PixivException.SERVER_ERROR)
+
+    @staticmethod
+    def _http_error_body(err):
+        for getter in ("get_data", "read"):
+            fn = getattr(err, getter, None)
+            if fn is None:
+                continue
+            try:
+                body = fn()
+                if body is not None:
+                    return body
+            except Exception:
+                continue
+        return b""
+
     def open_with_retry(self, url, data=None, timeout=60, retry=0):
         ''' Return response object with retry.'''
         retry_count = 0
         if retry == 0 and self._config is not None:
             retry = self._config.retry
 
+        # url can be a plain string or a mechanize/urllib Request
+        full_url, req_data, req_headers, method = url, data, {}, "GET"
+        if not isinstance(url, str):
+            try:
+                full_url = url.get_full_url()
+                req_headers = dict(url.header_items())
+                method = url.get_method()
+                if req_data is None:
+                    req_data = getattr(url, "data", None)
+            except AttributeError:
+                full_url = str(url)
+        if req_data is not None and method == "GET":
+            method = "POST"  # urllib semantics: a request body means POST
+        use_curl = self._use_curl_for(full_url, req_data, method)
+
         while True:
             res = None
             try:
-                res = self.open(url, data, timeout)
-                return res
-            except HTTPError as fanboxError:
-                if res is not None:
-                    print(f"Error Code: {res.code}")
-                    print(f"Response Headers: {res.headers}")
-                    if res.code == '302':
-                        print(f"Redirect to {res.headers['location']}")
+                print(f'self.open({url}, {data}, {timeout})')
+                if use_curl:
+                    res = self._curl_open(full_url, req_headers, timeout, method, req_data)
                 else:
-                    # Issue #1342
-                    if "challenge_basic_security_FANBOX" in str(fanboxError.get_data()) and fanboxError.getcode() == 403:
-                        return fanboxError
+                    res = self.open(url, data, timeout)
+                return res
+            except HTTPError as http_error:
+                body = self._http_error_body(http_error)
+                code = http_error.getcode()
+                # Issue #1342
+                if "challenge_basic_security_FANBOX" in str(body) and code == 403:
+                    return http_error
+                if code in (403, 429):
+                    text = body.decode("utf-8", "replace") if isinstance(body, (bytes, bytearray)) else str(body)
+                    PixivHelper.print_and_log('error', f'HTTP {code} for {full_url}: {text[:500]}')
+                    if _looks_like_cloudflare_challenge(body):
+                        PixivHelper.print_and_log('error', 'Cloudflare challenge detected: check the cookie, the user-agent '
+                                                           'in config.ini and that you are on the same IP as the browser.')
                 raise
             except BaseException:
                 exc_value = sys.exc_info()[1]
@@ -268,7 +564,7 @@ class PixivBrowser(mechanize.Browser):
                     except HTTPError as ex:
                         if ex.code in [403, 404, 503]:
                             read_page = ex.read()
-                            raise PixivException(f"Failed to get page: {url} => {ex}", errorCode=PixivException.SERVER_ERROR)
+                            raise PixivException(f"Failed to get page: {url} => {ex}", errorCode=PixivException.SERVER_ERROR, htmlPage=read_page)
                         else:
                             PixivHelper.print_and_log('error', f'Error at getPixivPage(): {sys.exc_info()}')
                             raise PixivException(f"Failed to get page: {url}", errorCode=PixivException.SERVER_ERROR)
@@ -301,36 +597,53 @@ class PixivBrowser(mechanize.Browser):
                 return "http://www.pixiv.net" + url
         return url
 
+    def _load_cookie_header(self, header, domain):
+        """ Load a 'name=value; name2=value2' cookie string into the cookie jar for the given domain. """
+        header = header.strip().strip('"\'')
+        if header.lower().startswith("cookie:"):
+            header = header[len("cookie:"):].strip()
+        for part in header.split(";"):
+            name, sep, value = part.partition("=")  # values may contain '='
+            name = name.strip()
+            if not name or not sep:
+                continue
+            self.addCookie(http.cookiejar.Cookie(version=0, name=name, value=value.strip(), port=None,
+                                                 port_specified=False, domain=domain, domain_specified=False,
+                                                 domain_initial_dot=False, path='/', path_specified=True,
+                                                 secure=False, expires=None, discard=True, comment=None,
+                                                 comment_url=None, rest={'HttpOnly': None}, rfc2109=False))
+
     def _loadCookie(self, cookie_value, domain):
         """ Load cookie to the Browser instance """
         ck = None
+
+        # tolerate a pasted "Cookie: ..." header line and surrounding quotes
+        cookie_value = cookie_value.strip().strip('"\'')
+        if cookie_value.lower().startswith("cookie:"):
+            cookie_value = cookie_value[len("cookie:"):].strip()
+
+        # full FANBOX cookie string (FANBOXSESSID, cf_clearance, ...)
+        if "fanbox.cc" in domain and cookie_value.find("FANBOXSESSID=") > -1:
+            self._load_cookie_header(cookie_value, "fanbox.cc")
+            return
 
         # full cookies string
         if cookie_value.find("PHPSESSID=") > -1:
             cookies = cookie_value.split(";")
             for cookie in cookies:
-                temp = cookie.split("=")
+                temp = cookie.split("=", 1)  # values may contain '='
                 name = temp[0].strip()
-                value = temp[1] if len(temp) > 1 else ""
+                if not name:
+                    continue
+                value = temp[1].strip() if len(temp) > 1 else ""
                 domain = ".pixiv.net"
                 if name in ("adr_id", "categorized_tags", "first_visit_datetime_pc", "tags_sended", "yuid_b"):
                     domain = "www.pixiv.net"
-                elif name in ("login_ever"):
+                elif name in ("login_ever",):
                     domain = ".www.pixiv.net"
-
-                final_domain: Literal['www.pixiv.net', '.www.pixiv.net', '.pixiv.net'] = domain
-                domain_specified: bool      = False
-                domain_initial_dot: bool    = False
-
-                # Override: Send PHPSESSID cookie to ".pixiv.net" domain.
-                if name == "PHPSESSID" and "pixiv.net" in domain:
-                    final_domain            = ".pixiv.net"
-                    domain_specified        = True
-                    domain_initial_dot      = True
-
                 ck = http.cookiejar.Cookie(version=0, name=name, value=value, port=None,
-                                           port_specified=False, domain=final_domain, domain_specified=domain_specified,
-                                           domain_initial_dot=domain_initial_dot, path='/', path_specified=True,
+                                           port_specified=False, domain=domain, domain_specified=False,
+                                           domain_initial_dot=False, path='/', path_specified=True,
                                            secure=False, expires=None, discard=True, comment=None,
                                            comment_url=None, rest={'HttpOnly': None}, rfc2109=False)
                 self.addCookie(ck)
@@ -338,8 +651,8 @@ class PixivBrowser(mechanize.Browser):
         else:
             if "pixiv.net" in domain:
                 ck = http.cookiejar.Cookie(version=0, name='PHPSESSID', value=cookie_value, port=None,
-                                           port_specified=False, domain='.pixiv.net', domain_specified=True,
-                                           domain_initial_dot=True, path='/', path_specified=True,
+                                           port_specified=False, domain='pixiv.net', domain_specified=False,
+                                           domain_initial_dot=False, path='/', path_specified=True,
                                            secure=False, expires=None, discard=True, comment=None,
                                            comment_url=None, rest={'HttpOnly': None}, rfc2109=False)
             elif "fanbox.cc" in domain:
@@ -368,27 +681,7 @@ class PixivBrowser(mechanize.Browser):
             PixivHelper.print_and_log('info', 'Trying to log in with saved cookie')
             self.clearCookie()
             self._loadCookie(login_cookie, "pixiv.net")
-
-            # Disable redirect and confirm that User ID is obtained.
-            # This will confirm successful login.
-            self.set_handle_redirect(False)
-            headers = {}
-            try:
-                r0 = self.open('https://www.pixiv.net')
-                if r0 is not None and hasattr(r0, "info") and callable(r0.info):
-                    headers = dict(r0.info().items())
-            except HTTPError as ex:
-                if ex.headers is not None:
-                    headers = dict(ex.headers.items())
-            finally:
-                self.set_handle_redirect(True)
-            x_uid = headers.get('x-userid') or headers.get('X-UserId') or headers.get('X-Userid')
-            if x_uid:
-                PixivHelper.print_and_log('info', f'Login recognized by server (x-userid={x_uid}).')
-                self._myId = int(x_uid)
-                PixivHelper.print_and_log('info', f'My User Id: {self._myId}.')
-                return True
-
+            self._load_cloudflare_cookies()
             res = self.open_with_retry('https://www.pixiv.net')  # + self._locale)
             assert (res is not None)
             parsed = BeautifulSoup(res, features="html5lib")
@@ -404,7 +697,8 @@ class PixivBrowser(mechanize.Browser):
                 result = True
             if "_gaq.push(['_setCustomVar', 1, 'login', 'yes'" in parsed_str:
                 result = True
-            if "var dataLayer = [{ login: 'yes'," in parsed_str:
+            if ("var dataLayer = [{ login: 'yes'," in parsed_str
+                    or re.search(r"dataLayer\s*=\s*\[\s*\{\s*login\s*:\s*['\"]yes['\"]", parsed_str)):
                 result = True
 
             if result:
@@ -418,62 +712,50 @@ class PixivBrowser(mechanize.Browser):
             else:
                 PixivHelper.get_logger().info('Failed to log in using cookie')
                 PixivHelper.print_and_log('info', 'Cookie already expired/invalid.')
+                self._log_login_check_failure(res.geturl(), parsed_str)
 
         return result
 
     def fanboxLoginUsingCookie(self, login_cookie=None):
-        """  Log in to Pixiv using saved cookie, return True if success """
+        """  Log in to FANBOX using saved cookie, return True if success """
         result = False
-        parsed = ""
+        page = None
+        res = None
         if login_cookie is None or len(login_cookie) == 0:
             login_cookie = self._config.cookieFanbox
-
-        # Issue #1342
-        if self._config.cf_clearance != "":
-            ck1 = http.cookiejar.Cookie(version=0, name='cf_clearance', value=self._config.cf_clearance, port=None,
-                                        port_specified=False, domain='fanbox.cc', domain_specified=False,
-                                        domain_initial_dot=False, path='/', path_specified=True,
-                                        secure=False, expires=None, discard=True, comment=None,
-                                        comment_url=None, rest={'HttpOnly': None}, rfc2109=False)
-            self.addCookie(ck1)
-        if self._config.cf_bm != "":
-            ck2 = http.cookiejar.Cookie(version=0, name='__cf_bm', value=self._config.cf_bm, port=None,
-                                        port_specified=False, domain='fanbox.cc', domain_specified=False,
-                                        domain_initial_dot=False, path='/', path_specified=True,
-                                        secure=False, expires=None, discard=True, comment=None,
-                                        comment_url=None, rest={'HttpOnly': None}, rfc2109=False)
-            self.addCookie(ck2)
 
         if len(login_cookie) > 0:
             PixivHelper.print_and_log('info', 'Trying to log in FANBOX with saved cookie')
             # self.clearCookie()
             self._loadCookie(login_cookie, "fanbox.cc")
 
+        # Issue #1342: cf_clearance / __cf_bm from config.ini, unless the pasted cookie string already has them
+        self._load_cloudflare_cookies("fanbox.cc", "https://www.fanbox.cc/")
+
+        if len(login_cookie) > 0:
             req = mechanize.Request("https://www.fanbox.cc")
             req.add_header('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8')
             req.add_header('Origin', 'https://www.fanbox.cc')
             req.add_header('User-Agent', self._config.useragent)
             try:
                 res = self.open_with_retry(req)
-                parsed = BeautifulSoup(res, features="html5lib")
+                page = res.read().decode("utf-8", "replace")
                 PixivHelper.get_logger().info('Logging in with cookie to Fanbox, return url: %s', res.geturl())
                 res.close()
             except BaseException:
                 PixivHelper.get_logger().error('Error at fanboxLoginUsingCookie(): %s', sys.exc_info())
-                self.cookiejar.clear("fanbox.cc")
 
-            if '"user":{"isLoggedIn":true' in str(parsed):
-                result = True
-                self._is_logged_in_to_FANBOX = True
-            # Issue #1342
-            elif "challenge_basic_security_FANBOX" in str(parsed):
-                fanboxErrorPage = parsed.decode('utf-8')
-                parsed.decompose()
-                del parsed
-                raise PixivException("Failed FANBOX Cloudflare CAPTCHA challenge, please check your cookie and user-agent settings.",
-                                             errorCode=PixivException.CANNOT_LOGIN, htmlPage=fanboxErrorPage)
-            parsed.decompose()
-            del parsed
+            if page is not None:
+                if re.search(r'"user"\s*:\s*\{\s*"isLoggedIn"\s*:\s*true', page):
+                    result = True
+                    self._is_logged_in_to_FANBOX = True
+                # Issue #1342
+                elif "challenge_basic_security_FANBOX" in page:
+                    raise PixivException("Failed FANBOX Cloudflare CAPTCHA challenge, please check your cookie and user-agent settings.",
+                                         errorCode=PixivException.CANNOT_LOGIN, htmlPage=page)
+                else:
+                    self._log_login_check_failure(res.geturl(), page, "https://www.fanbox.cc",
+                                                  "fanbox_login_check_failed.html", "FANBOX login check")
 
         if result:
             PixivHelper.print_and_log('info', 'FANBOX Login successful.')
@@ -510,32 +792,41 @@ class PixivBrowser(mechanize.Browser):
                 "tt": match.group()}
 
         p_req = mechanize.Request("https://accounts.pixiv.net/account-selected", data, method="POST")
+        p_req.add_header('Referer', 'https://www.fanbox.cc/login?return_to=https%3A%2F%2Fwww.fanbox.cc%2F')
         try:
             p_res = self.open_with_retry(p_req)
-            parsed = BeautifulSoup(p_res, features="html5lib")
+            page = p_res.read().decode("utf-8", "replace")
+            final_url = p_res.geturl()
             p_res.close()
         except BaseException:
             PixivHelper.get_logger().error('Error at updateFanboxCookie(): %s', sys.exc_info())
             return False
 
         result = False
-        if '"user":{"isLoggedIn":true' in str(parsed):
+        if re.search(r'"user"\s*:\s*\{\s*"isLoggedIn"\s*:\s*true', page):
             result = True
             self._is_logged_in_to_FANBOX = True
-        parsed.decompose()
-        del parsed
 
         if result:
-            for cookie in self._ua_handlers['_cookies'].cookiejar:
-                if cookie.name == 'FANBOXSESSID':
-                    PixivHelper.print_and_log(
-                        'info', 'New FANBOX cookie value: ' + str(cookie.value))
-                    self._config.cookieFanbox = cookie.value
-                    self._config.writeConfig(path=self._config.configFileLocation)
-                    break
+            session_cookie = self._find_fanbox_session_cookie()
+            if session_cookie:
+                PixivHelper.print_and_log('info', 'New FANBOX cookie value: ' + str(session_cookie))
+                self._config.cookieFanbox = session_cookie
+                self._config.writeConfig(path=self._config.configFileLocation)
         else:
+            self._log_login_check_failure(final_url, page, "https://www.fanbox.cc",
+                                          "fanbox_cookie_refresh_failed.html", "FANBOX cookie refresh")
             PixivHelper.print_and_log('info', 'Could not update FANBOX cookie string.')
         return result
+
+    def _find_fanbox_session_cookie(self):
+        """ Newest FANBOXSESSID value in the cookie jars, or None. """
+        found = None
+        for jar in self._cookie_jars():
+            for cookie in jar:
+                if cookie.name == 'FANBOXSESSID' and (cookie.domain or "").lstrip(".").lower().endswith("fanbox.cc"):
+                    found = cookie.value
+        return found
 
     def login(self, username, password):
         parsed = None
@@ -816,7 +1107,10 @@ class PixivBrowser(mechanize.Browser):
             errorCode = error.getcode()
             errorMessage = error.get_data()
             PixivHelper.get_logger().error("Error data: \r\n %s", errorMessage)
-            payload = demjson3.decode(errorMessage)
+            try:
+                payload = demjson3.decode(errorMessage)
+            except Exception:
+                payload = {"message": f"HTTP {errorCode}: non-JSON error response from server"}
             # Issue #432
             msg = None
             if "message" in payload:
@@ -827,6 +1121,8 @@ class PixivBrowser(mechanize.Browser):
                 msgs.append(payload["error"]["message"])
                 msgs.append(payload["error"]["reason"])
                 msg = ",".join(msgs)
+            if errorCode == 403 and _looks_like_cloudflare_challenge(errorMessage):
+                raise PixivException(f"Blocked by Cloudflare challenge ({msg})", errorCode=PixivException.SERVER_ERROR, htmlPage=errorMessage)
             if errorCode == 401:
                 raise PixivException(msg, errorCode=PixivException.NOT_LOGGED_IN, htmlPage=errorMessage)
             elif errorCode == 403:
@@ -984,26 +1280,6 @@ class PixivBrowser(mechanize.Browser):
 
         return (result, response_page)
 
-    def getTagInfo(self, tag, lang=None) -> PixivTag:
-        if tag is None or len(tag) == 0:
-            raise PixivException("Tag is empty.", errorCode=PixivException.OTHER_ERROR)
-
-        encoded_tag = PixivHelper.encode_tags(tag)
-        url = f'https://www.pixiv.net/ajax/search/tags/{encoded_tag}'
-        if lang is None:
-            lang = self._locale
-        if lang:
-            url = f'{url}?lang={lang}'
-
-        response = self._get_from_cache(url)
-        if response is None:
-            res = self.open_with_retry(url)
-            response = res.read()
-            res.close()
-            self._put_to_cache(url, response)
-
-        return PixivTag(json.loads(response))
-
     def handleDebugTagSearchPage(self, response, url):
         if self._config.enableDump:
             if self._config.dumpTagSearchPage:
@@ -1093,50 +1369,6 @@ class PixivBrowser(mechanize.Browser):
         else:
             raise PixivException("Id does not exist", errorCode=PixivException.USER_ID_NOT_EXISTS)
 
-    def fanboxGetLatestSupportingPosts(self, pages) -> List[FanboxPost]:
-        self.fanbox_is_logged_in()
-        supported_creator_ids = {
-            str(creator_id)
-            for creator_id in self.fanboxGetArtistList(FanboxArtist.SUPPORTING)
-        }
-        artists = {}
-        posts = []
-        _tzInfo = None
-        if self._config.useLocalTimezone:
-            _tzInfo = PixivHelper.LocalUTCOffsetTimezone()
-
-        url = 'https://api.fanbox.cc/post.listSupporting?limit=10'
-        for current_page in range(1, pages + 1):
-            PixivHelper.print_and_log('info', f'Getting latest supporting posts page {current_page} from {url}')
-            req = mechanize.Request(url)
-            req.add_header('Accept', 'application/json, text/plain, */*')
-            req.add_header('Referer', 'https://www.fanbox.cc/')
-            req.add_header('Origin', 'https://www.fanbox.cc')
-            req.add_header('User-Agent', self._config.useragent)
-
-            res = self.open_with_retry(req)
-            response = res.read()
-            res.close()
-
-            js = demjson3.decode(response)
-            if "error" in js and js["error"]:
-                raise PixivException("Error when requesting latest supporting posts", 9999, response)
-            if "body" not in js or js["body"] is None:
-                break
-
-            for js_post in js["body"]["items"]:
-                creator_id = str(js_post["creatorId"])
-                if creator_id not in supported_creator_ids:
-                    continue
-                if creator_id not in artists:
-                    artists[creator_id] = self.fanboxGetArtistById(creator_id)
-                posts.append(FanboxPost(js_post["id"], artists[creator_id], js_post, _tzInfo))
-
-            url = js["body"].get("nextUrl")
-            if not url:
-                break
-        return posts
-
     def fanboxGetPostsFromArtist(self, artist: FanboxArtist = None, next_url="") -> List[FanboxPost]:
         ''' get all posts from the supported user
         from https://fanbox.pixiv.net/api/post.listCreator?userId=1305019&limit=10 '''
@@ -1188,19 +1420,16 @@ class PixivBrowser(mechanize.Browser):
 
     def fanboxUpdatePost(self, post: FanboxPost):
         js = self.fanboxGetPostJsonById(post.imageId, post.parent)
-        data = js["body"]
-        if "post" in data:  # new API response as of 2026-07-25
-            data = data["post"]
-        post.parsePost(data)
-        post.parse_post_details(data)
+        post.parsePost(js["body"])
+        post.parse_post_details(js["body"])
 
     def fanboxGetPostById(self, post_id):
         js = self.fanboxGetPostJsonById(post_id)
         _tzInfo = None
         if self._config.useLocalTimezone:
             _tzInfo = PixivHelper.LocalUTCOffsetTimezone()
-        artist = self.fanboxGetArtistById(js["body"]["post"]["creatorId"])
-        post = FanboxPost(post_id, artist, js["body"]["post"], _tzInfo)
+        artist = self.fanboxGetArtistById(js["body"]["creatorId"])
+        post = FanboxPost(post_id, artist, js["body"], _tzInfo)
         return post
 
     def fanboxGetPostJsonById(self, post_id, artist=None):
@@ -1211,24 +1440,25 @@ class PixivBrowser(mechanize.Browser):
         # referer doesn't seeem to be essential
         p_referer = f"https://www.fanbox.cc/@{artist.creatorId if artist else ''}/posts/{post_id}"
         PixivHelper.get_logger().debug('Getting post detail from %s', p_url)
+
+        # optional full cookie string from config (cookieFanboxTemp), merged into the FANBOX cookies
+        temp_cookie = getattr(self._config, "cookieFanboxTemp", "")
+        if temp_cookie:
+            self._load_cookie_header(temp_cookie, "fanbox.cc")
+
         p_req = mechanize.Request(p_url)
         p_req.add_header('Accept', 'application/json, text/plain, */*')
         p_req.add_header('Referer', p_referer)
         p_req.add_header('Origin', 'https://www.fanbox.cc')
         p_req.add_header('User-Agent', self._config.useragent)
-        p_req.add_header('Cookie', "; ".join(
-            f"{c.name}={c.value}" for c in self._ua_handlers['_cookies'].cookiejar
-            if c.domain in (".fanbox.cc", "fanbox.cc", "api.fanbox.cc")
-        ))
-        impersonation = self._config.userAgentImpersonation or "firefox135" # default value
 
         try:
-            p_res = curl_cffi.get(p_url, impersonate=impersonation, headers=p_req.headers)
+            p_res = self.open_with_retry(p_req)
         except HTTPError as ex:
             if ex.code in [404]:
                 raise PixivException("Fanbox post not found!", PixivException.OTHER_ERROR)
             raise
-        p_response = p_res.text
+        p_response = p_res.read().decode("utf-8")
         PixivHelper.get_logger().debug(p_response)
         p_res.close()
         js = demjson3.decode(p_response)

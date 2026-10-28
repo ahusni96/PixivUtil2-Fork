@@ -71,3 +71,5 @@ Error*
 test/cookie.txt
 test/fanbox_cookie.txt
 test/test_browser.py
+dumps/
+Downloads/

@@ -499,7 +499,6 @@ class PixivBrowser(mechanize.Browser):
         while True:
             res = None
             try:
-                print(f'self.open({url}, {data}, {timeout})')
                 if use_curl:
                     res = self._curl_open(full_url, req_headers, timeout, method, req_data)
                 else:
@@ -1420,8 +1419,8 @@ class PixivBrowser(mechanize.Browser):
 
     def fanboxUpdatePost(self, post: FanboxPost):
         js = self.fanboxGetPostJsonById(post.imageId, post.parent)
-        post.parsePost(js["body"])
-        post.parse_post_details(js["body"])
+        post.parsePost(js["body"]["post"])
+        post.parse_post_details(js["body"]["post"])
 
     def fanboxGetPostById(self, post_id):
         js = self.fanboxGetPostJsonById(post_id)
